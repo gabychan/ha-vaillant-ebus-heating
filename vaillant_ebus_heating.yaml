@@ -1,0 +1,220 @@
+# =============================================================================
+# Vaillant ecoTEC plus (BAI00) - heating control over eBUS with ebusd
+# Home Assistant package.   EXPERIMENTAL: read README.md (safety section) first.
+#
+# Search this file for "CHANGE ME". There are three things to adapt:
+#   1. climate -> target_sensor      your room temperature sensor
+#   2. script.boiler_notify          your notify service (e.g. your phone)
+#   3. heartbeat automation          flow_temp, the radiator flow temperature (C)
+#
+# Assumes ebusd publishes the boiler under the circuit name "bai", i.e. topics
+# like ebusd/bai/SetMode/set and ebusd/bai/Statenumber. Change the topics below
+# if your circuit has another name.
+# =============================================================================
+
+# --- Demand toggle: the thermostat switches it, the heartbeat reads it --------
+input_boolean:
+  boiler_demand:
+    name: Boiler demand
+    icon: mdi:fire
+
+# --- Boiler sensors read from ebusd -------------------------------------------
+# expire_after turns a sensor "unavailable" after 5 minutes without data, which
+# is what the "no data" alert below relies on.
+mqtt:
+  sensor:
+    - name: "Boiler Statenumber"
+      unique_id: boiler_statenumber
+      state_topic: "ebusd/bai/Statenumber"
+      value_template: "{{ value_json.value.value }}"
+      expire_after: 300
+      icon: mdi:state-machine
+    - name: "Boiler Flame"
+      unique_id: boiler_flame
+      state_topic: "ebusd/bai/Flame"
+      value_template: "{{ value_json.value.value }}"
+      expire_after: 300
+      icon: mdi:fire
+    - name: "Boiler Water Pressure"
+      unique_id: boiler_water_pressure
+      state_topic: "ebusd/bai/WaterPressure"
+      value_template: "{{ value_json.press.value }}"
+      unit_of_measurement: "bar"
+      device_class: pressure
+      state_class: measurement
+
+# --- Virtual switch: the generic thermostat needs a switch as its heater ------
+template:
+  - switch:
+      - name: "Boiler Switch"
+        unique_id: boiler_switch_virtual
+        state: "{{ is_state('input_boolean.boiler_demand', 'on') }}"
+        turn_on:
+          action: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.boiler_demand
+        turn_off:
+          action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.boiler_demand
+
+# --- Thermostat ----------------------------------------------------------------
+climate:
+  - platform: generic_thermostat
+    name: Boiler thermostat
+    unique_id: boiler_thermostat
+    heater: switch.boiler_switch
+    target_sensor: sensor.living_room_temperature   # CHANGE ME
+    min_temp: 15
+    max_temp: 25
+    target_temp_step: 0.5
+    ac_mode: false
+    target_temp: 21.0
+    cold_tolerance: 0.3
+    hot_tolerance: 0.3
+
+# --- One place for the notification service -----------------------------------
+script:
+  boiler_notify:
+    alias: "Boiler: send notification"
+    fields:
+      title:
+        description: Notification title
+        example: Boiler
+      message:
+        description: Notification text
+        example: Pressure is low
+    sequence:
+      - action: notify.mobile_app_your_phone   # CHANGE ME
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+
+automation:
+  # --- Heartbeat: the ONLY automation that should write SetMode ---------------
+  # Sends the right order every minute, right after the demand changes and at
+  # start-up. Orders stay active on the boiler for roughly 15 minutes, so a lost
+  # message does not change the state.
+  #   auto;<flow>;-;-;0;...  heat
+  #   auto;<flow>;-;-;1;...  stop heating, hot water untouched (disablehc = 1)
+  # Do not use "water;..." or "off;..." to stop heating (see README, pitfalls).
+  - id: boiler_heartbeat_setmode
+    alias: "Boiler: heartbeat SetMode"
+    mode: restart
+    variables:
+      flow_temp: 45   # CHANGE ME if you need hotter radiators (the boiler dial still caps it)
+    triggers:
+      - trigger: time_pattern
+        minutes: /1
+      - trigger: state
+        entity_id: input_boolean.boiler_demand
+      - trigger: homeassistant
+        event: start
+    actions:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.boiler_demand
+                state: "on"
+            sequence:
+              - action: mqtt.publish
+                data:
+                  topic: ebusd/bai/SetMode/set
+                  payload: "auto;{{ flow_temp | int(45) }};-;-;0;0;0;0;0;0"
+        default:
+          - action: mqtt.publish
+            data:
+              topic: ebusd/bai/SetMode/set
+              payload: "auto;{{ flow_temp | int(45) }};-;-;1;0;0;0;0;0"
+
+  # --- Polling: ebusd does not publish these values until someone asks --------
+  - id: boiler_read_state
+    alias: "Boiler: read state"
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: /1
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: ebusd/bai/Statenumber/get
+          payload: ""
+      - action: mqtt.publish
+        data:
+          topic: ebusd/bai/Flame/get
+          payload: ""
+
+  - id: boiler_read_pressure
+    alias: "Boiler: read pressure"
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: /15
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: mqtt.publish
+        data:
+          topic: ebusd/bai/WaterPressure/get
+          payload: ""
+
+  # --- Alerts -------------------------------------------------------------------
+  # The jumper makes the boiler fail towards heating, so these matter.
+  - id: boiler_alert_heating_without_demand
+    alias: "Boiler: heating without demand"
+    description: Flame on (S.4) for 10 minutes while the thermostat asks for no heat.
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >-
+          {{ states('sensor.boiler_statenumber') == '4'
+             and is_state('input_boolean.boiler_demand', 'off') }}
+        for: "00:10:00"
+    actions:
+      - action: script.boiler_notify
+        data:
+          title: Boiler
+          message: >-
+            The boiler has been heating for 10 minutes with no demand from the
+            thermostat. Home Assistant may have stopped sending the stop order.
+
+  - id: boiler_alert_no_data
+    alias: "Boiler: no data"
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.boiler_statenumber
+        to:
+          - unavailable
+          - unknown
+        for: "00:05:00"
+    actions:
+      - action: script.boiler_notify
+        data:
+          title: Boiler
+          message: >-
+            No data from the boiler for 5 minutes. If heating was stopped, it may
+            restart by itself in about 15 minutes.
+
+  - id: boiler_alert_pressure
+    alias: "Boiler: pressure"
+    description: Vaillant gives 1.0 to 2.0 bar cold; S.41 appears above 2.9 bar.
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.boiler_water_pressure
+        below: 1
+        for: "00:30:00"
+        id: low
+      - trigger: numeric_state
+        entity_id: sensor.boiler_water_pressure
+        above: 2.5
+        for: "00:30:00"
+        id: high
+    actions:
+      - action: script.boiler_notify
+        data:
+          title: "Boiler: {{ 'low' if trigger.id == 'low' else 'high' }} pressure"
+          message: "Circuit pressure is {{ states('sensor.boiler_water_pressure') }} bar."
