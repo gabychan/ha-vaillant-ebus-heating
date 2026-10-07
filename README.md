@@ -19,16 +19,19 @@ different terminals.
 
 Verified on that boiler (6 Oct 2026):
 
-- A heating demand lights the burner in under 30 seconds (S.2, S.3, S.4 with flame).
+- A heating demand lights the burner in 30 to 60 seconds (S.0, sometimes S.97, then S.2, S.3, S.4 with flame).
 - Stopping heating switches the burner off within seconds; the boiler settles at
   S.31 after 1.5 to 4 minutes (S.5, S.7, S.8, S.31), with no hot-water warm-start
   cycles and no S.54 waiting period.
 - Hot water starts normally (S.13, S.14) while heating is disabled.
 - The MQTT sensors, the polling and the alerts work.
+- With the thermostat in the loop (mild weather, after a setpoint change), the
+  thermostat switched the demand on and off by itself and the burner ran steadily
+  for almost 4 minutes at the requested 45 °C flow.
 
-**Not yet verified:** a full run driven by the thermostat itself in cold weather
-(the room was warmer than the setpoint during every test), and long-term
-behaviour. Reports from other boilers are welcome (see the end).
+**Not yet verified:** a heating run in real cold weather, where the room cools
+down and the thermostat asks for heat on its own, and long-term behaviour over a
+heating season. Reports from other boilers are welcome (see the end).
 
 ## Safety: read this first
 
@@ -159,6 +162,8 @@ move the three sensors into your own `mqtt:` section instead.
    watch the state: `S.0`, `S.2`, `S.3`, `S.4` with flame. Turn it off: `S.5`,
    `S.7`, `S.8`, `S.31`. (With the thermostat in heat mode and a warm room, the
    thermostat switches the demand off again within seconds; that is expected.)
+   While the flame is on, `ebusctl read -m 0 -c bai FlowTempDesired` must show
+   the flow temperature you ordered (45 by default).
 4. Open a hot-water tap while heating is stopped: `S.13`, `S.14` with flame.
 
 ## Entities created
@@ -196,7 +201,7 @@ Meanings from table 9.1 of the Vaillant installation manual (document
 | S.0 | No heat demand | A few seconds right after a demand arrived |
 | S.2 | Heating: pump pre-run | Before ignition |
 | S.3 | Heating: ignition | Before the flame |
-| S.4 | Heating: burner running | Within 30 s of the demand |
+| S.4 | Heating: burner running | 30 to 60 s after the demand |
 | S.5, S.6, S.7 | Heating: fan and pump overrun | From the stop order, for about 1 to 3 minutes |
 | S.8 | Burner lock after heating | Between S.7 and S.31 |
 | S.10, S.13 | Hot water: tap on, ignition | A tap opened |
@@ -232,13 +237,26 @@ Meanings from table 9.1 of the Vaillant installation manual (document
   value is the `WaterPressure` message (`press.value`).
 - **Sensors without polling stay empty.** `Statenumber` and `Flame` read
   `no data stored` until something requests them.
+- **A flow-temperature helper starts at its minimum.** If you replace the fixed
+  `flow_temp` of the heartbeat with an `input_number`, a helper created in the UI
+  has no initial value and starts at its minimum. Ours started at 35: the
+  heartbeat sent `auto;35;...` to heat, the boiler worked against 35 and cut the
+  flame at about 40 °C (35 plus roughly 5 K), after 8 to 90 seconds. This package
+  uses a fixed value to avoid it. Whatever you do, check that `FlowTempDesired`
+  shows your order while the flame is on.
+- **The burner lock delays the next start.** After every burner stop the boiler
+  locks the burner (`RemainingBoilerblocktime`). We saw 4 to 6 minutes, and a
+  demand that arrived during the lock waited in S.0 until it ended: 2 minutes 20
+  seconds from demand to flame in one case. Check the lock before judging a slow
+  start.
 
 ## Open points
 
 - A heating run driven by the thermostat in real cold weather.
 - Short cycling: the thermostat tolerance is 0.3 °C on both sides; the boiler's
   burner lock (S.8, default up to 20 minutes, diagnostic code d.2) should limit
-  it, but it was not watched over a day.
+  it. In our tests the lock after a burner stop showed 4 to 6 minutes; it was not
+  watched over a whole day.
 - The 15-minute order lifetime was measured once.
 - On the first afternoon the thermostat went back to heat on its own three times,
   17 to 52 seconds after being switched off, with no automation named in the
